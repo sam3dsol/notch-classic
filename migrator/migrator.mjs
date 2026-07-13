@@ -17,8 +17,12 @@
 //      wallet so the platform harvests the pool's trading fees forever.
 //   5. records the migration + WhatsApp-alerts.
 //
-// HARVEST=1 mode: instead of polling, claims accrued trading fees from every
-// locked pool's Fee Key NFT to the platform wallet, then exits (run on a cron).
+// HARVEST=1 mode: MANUAL ONLY (operator runs it by hand, never auto/cron).
+// Claims accrued trading fees from every locked pool's Fee Key NFT to the
+// platform wallet, then exits. Fees arrive as BOTH token and SOL (constant-
+// product pools skim the fee from each swap's input side). Claiming does NOT
+// swap or dump — it just credits the wallet; the operator keeps the SOL and
+// decides separately whether to hold or convert the token portion.
 //
 // Safety: DRY_RUN=1 by default (simulates, never signs a live migrate/pool).
 // Arm with DRY_RUN=0 once a real pool is close to graduating.
@@ -220,7 +224,9 @@ async function migrateOne(rec) {
 }
 
 // HARVEST mode: claim accrued trading fees from every locked pool's Fee Key NFT
-// to the platform wallet. Run periodically (cron). Exits when done.
+// to the platform wallet. MANUAL ONLY — the operator runs this by hand; it is
+// never auto-scheduled. Fees arrive as both token and SOL; claiming is not a
+// swap, so it never touches the pool price.
 async function harvestAll() {
   const { Raydium, TxVersion } = await import('@raydium-io/raydium-sdk-v2');
   const raydium = await Raydium.load({ connection: conn, owner: platform, cluster: 'mainnet' });

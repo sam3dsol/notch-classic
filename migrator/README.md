@@ -11,5 +11,10 @@ mechanics + market making), so the entire bonding-curve SOL goes into the pool
 as depth.
 
 `DRY_RUN=1` by default (simulates only). Run with `DRY_RUN=0` to arm.
-`HARVEST=1` claims accrued fees from every locked pool's Fee Key NFT to the platform wallet, then exits (run on a cron).
+`HARVEST=1` claims accrued fees from every locked pool's Fee Key NFT to the
+platform wallet, then exits. **Manual only** — run by hand, never on a cron.
+Fees arrive as both the token and SOL (constant-product pools skim the fee from
+each swap's input side); claiming is not a swap and never dumps on the pool. The
+operator keeps the SOL and decides separately whether to hold or convert the
+token portion.
 Env: `RPC`, `MIGRATOR_KP`, `PLATFORM_KP`, `POOL_STORE`, `POLL_MS`, `HARVEST`.
