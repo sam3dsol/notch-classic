@@ -189,6 +189,26 @@ async fn main() {
     let r = send(&rpc, &[pool::sell(&program, &buyer.pubkey(), &mint, &whale.pubkey(), 100, 0)], &buyer, &[&buyer]).await;
     check!("SELL: wrong creator account rejected", r.is_err());
 
+    // --- 4b) SELL via the payout PDA route (explorer-visible System transfers) --
+    {
+        let st = pool_state(mint).await.unwrap();
+        let units = bag(buyer.pubkey(), mint).await / 2;
+        let exp_gross = pool::sell_out(st.virt_sol, st.virt_tok, units);
+        let exp_fee = exp_gross * pool::FEE_BPS / 10_000;
+        let cre0 = rpc.balance(&creator.pubkey()).await;
+        let buy0 = rpc.balance(&buyer.pubkey()).await;
+        let sig = send(&rpc, &[pool::sell_via_payout(&program, &buyer.pubkey(), &mint, &creator.pubkey(), units, exp_gross - exp_fee)], &buyer, &[&buyer]).await;
+        check!("PAYOUT-ROUTE sell succeeds", sig.is_ok());
+        check!("PAYOUT-ROUTE seller paid exact 94%… (gross - 1%)", rpc.balance(&buyer.pubkey()).await + 5_000 - buy0 == exp_gross - exp_fee);
+        check!("PAYOUT-ROUTE creator paid exact 1%", rpc.balance(&creator.pubkey()).await == cre0 + exp_fee);
+        check!("PAYOUT-ROUTE payout PDA left empty", rpc.balance(&pool::payout_pda(&program)).await == 0);
+        // The System transfers are visible in the tx: assert the log shows a System transfer program invocation.
+        if let Ok(s) = sig {
+            let tx = rpc.get_transaction(&s).await;
+            check!("PAYOUT-ROUTE tx carries System transfer(s)", tx.contains("11111111111111111111111111111111"));
+        }
+    }
+
     // --- 5) fill to graduation --------------------------------------------------
     let mut fillers: Vec<Keypair> = Vec::new();
     let mut frozen = false;

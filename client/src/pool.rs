@@ -137,6 +137,11 @@ pub fn buy(
     }
 }
 
+pub fn payout_pda(program_id: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"payout"], program_id).0
+}
+
+/// Sell WITHOUT the payout route (direct lamport payout, 7 accounts).
 pub fn sell(
     program_id: &Pubkey,
     seller: &Pubkey,
@@ -161,7 +166,45 @@ pub fn sell(
     }
 }
 
+/// Sell WITH the payout route: appends the payout PDA + system program so the
+/// seller/creator legs are real System transfers (explorer-visible).
+pub fn sell_via_payout(
+    program_id: &Pubkey,
+    seller: &Pubkey,
+    mint: &Pubkey,
+    creator: &Pubkey,
+    units: u64,
+    min_out: u64,
+) -> Instruction {
+    let mut ix = sell(program_id, seller, mint, creator, units, min_out);
+    ix.accounts.push(AccountMeta::new(payout_pda(program_id), false));
+    ix.accounts.push(AccountMeta::new_readonly(system_program::ID, false));
+    ix
+}
+
+/// Migrate WITH the payout route (the operator always uses this): ops SOL to
+/// the platform and the LP SOL to the migrator as real System transfers.
 pub fn migrate(program_id: &Pubkey, migrator_key: &Pubkey, mint: &Pubkey) -> Instruction {
+    let (pda, _) = pool_pda(program_id, mint);
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(*migrator_key, true),
+            AccountMeta::new(pda, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new(ata(&pda, mint), false),
+            AccountMeta::new(ata(migrator_key, mint), false),
+            AccountMeta::new(platform_wallet(), false),
+            AccountMeta::new_readonly(token_program(), false),
+            AccountMeta::new(payout_pda(program_id), false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+        data: borsh::to_vec(&PoolInstruction::Migrate).unwrap(),
+    }
+}
+
+/// Migrate WITHOUT the payout route (direct lamport payout, 7 accounts).
+pub fn migrate_direct(program_id: &Pubkey, migrator_key: &Pubkey, mint: &Pubkey) -> Instruction {
     let (pda, _) = pool_pda(program_id, mint);
     Instruction {
         program_id: *program_id,

@@ -58,6 +58,11 @@ solana_security_txt::security_txt! {
 // ---------------------------------------------------------------------------
 
 pub const POOL_SEED: &[u8] = b"pool";
+/// Zero-data, system-owned PDA the Sell and Migrate payouts hop through so the
+/// seller, creator, platform and migrator legs are real System transfers
+/// (explorers render those; a direct lamport move on the data-carrying pool
+/// PDA would not). It never holds lamports across instructions.
+pub const PAYOUT_SEED: &[u8] = b"payout";
 /// mint(32) creator(32) virt_sol(8) virt_tok(8) real_sol(8) frozen(1)
 /// migrated(1) bump(1)
 pub const POOL_SIZE: usize = 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1; // = 91
@@ -186,7 +191,10 @@ pub enum PoolInstruction {
     /// to the pool's creator. Never gated.
     /// Accounts: [seller (signer, writable), pool PDA (writable), mint,
     ///            pool_vault (writable), seller_token_account (writable),
-    ///            creator (writable), token_program]
+    ///            creator (writable), token_program,
+    ///            payout PDA (writable, optional), system_program (optional)]
+    /// With the two optional accounts the seller/creator legs are real System
+    /// transfers (explorer-visible); without them, direct lamport moves.
     Sell { units: u64, min_out: u64 },
     /// After graduation, hand the raise to migration: OPS_SOL to the platform
     /// ops wallet, the remaining real SOL plus the entire unsold token balance
@@ -194,7 +202,10 @@ pub enum PoolInstruction {
     /// Only the hardcoded MIGRATOR may call, exactly once.
     /// Accounts: [migrator (signer, writable), pool PDA (writable), mint,
     ///            pool_vault (writable), migrator_token_account (writable),
-    ///            platform_wallet (writable), token_program]
+    ///            platform_wallet (writable), token_program,
+    ///            payout PDA (writable, optional), system_program (optional)]
+    /// With the two optional accounts the ops/migrator legs are real System
+    /// transfers (explorer-visible); without them, direct lamport moves.
     Migrate,
 }
 
@@ -322,6 +333,67 @@ fn spl_revoke_mint_authority(mint: &Pubkey, current: &Pubkey) -> Instruction {
         ],
         data: vec![6u8, 0u8, 0u8], // SetAuthority, MintTokens, COption::None
     }
+}
+
+/// Pay `to_recipient` lamports and (optionally) `to_creator` lamports out of the
+/// pool. `total` (= sum of the legs) is first moved from the pool PDA. If the
+/// caller passed the payout PDA + system program as the trailing two accounts,
+/// the legs are routed through the transient payout PDA as real System transfers
+/// (explorer-visible); otherwise they are direct lamport credits. The pool PDA
+/// rides along as an extra (ignored) account on the first System transfer so the
+/// runtime's pre-CPI balance check sees both sides of the pool->payout move.
+#[allow(clippy::too_many_arguments)]
+fn pay_out<'a, 'info>(
+    program_id: &Pubkey,
+    ai: &mut std::slice::Iter<'a, AccountInfo<'info>>,
+    pool_ai: &AccountInfo<'info>,
+    total: u64,
+    recipient_ai: &AccountInfo<'info>,
+    to_recipient: u64,
+    creator_ai: &AccountInfo<'info>,
+    to_creator: u64,
+) -> ProgramResult {
+    let via_payout = (|| -> Option<(AccountInfo, AccountInfo, u8)> {
+        let payout_ai = next_account_info(ai).ok()?.clone();
+        let system_ai = next_account_info(ai).ok()?.clone();
+        if *system_ai.key != system_program::ID {
+            return None;
+        }
+        let (expect, bump) = Pubkey::find_program_address(&[PAYOUT_SEED], program_id);
+        if expect != *payout_ai.key || !payout_ai.data_is_empty() || payout_ai.owner != &system_program::ID {
+            return None;
+        }
+        Some((payout_ai, system_ai, bump))
+    })();
+
+    **pool_ai.try_borrow_mut_lamports()? -= total;
+    match via_payout {
+        Some((payout_ai, system_ai, bump)) => {
+            **payout_ai.try_borrow_mut_lamports()? += total;
+            let seeds: &[&[u8]] = &[PAYOUT_SEED, &[bump]];
+            let mut t = system_instruction::transfer(payout_ai.key, recipient_ai.key, to_recipient);
+            t.accounts.push(AccountMeta::new(*pool_ai.key, false));
+            invoke_signed(
+                &t,
+                &[payout_ai.clone(), recipient_ai.clone(), pool_ai.clone(), system_ai.clone()],
+                &[seeds],
+            )?;
+            if to_creator > 0 {
+                invoke_signed(
+                    &system_instruction::transfer(payout_ai.key, creator_ai.key, to_creator),
+                    &[payout_ai.clone(), creator_ai.clone(), system_ai.clone()],
+                    &[seeds],
+                )?;
+            }
+        }
+        None => {
+            **recipient_ai.try_borrow_mut_lamports()? += to_recipient;
+            if to_creator > 0 {
+                **creator_ai.try_borrow_mut_lamports()? += to_creator;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn spl_transfer(src: &Pubkey, dst: &Pubkey, authority: &Pubkey, amount: u64) -> Instruction {
@@ -583,16 +655,16 @@ fn sell(program_id: &Pubkey, accounts: &[AccountInfo], units: u64, min_out: u64)
         return Err(err(E_SLIPPAGE));
     }
 
-    // Tokens back to the vault (seller signs), then pay out of the pool.
+    // Tokens back to the vault (seller signs), then pay out of the pool. The
+    // token CPI runs BEFORE the payout moves so the runtime's pre-CPI balance
+    // check on the later System transfers is not thrown off. With the optional
+    // payout PDA + system program the seller/creator legs are real System
+    // transfers (explorer-visible); without them, direct lamport moves.
     invoke(
         &spl_transfer(seller_ta_ai.key, vault_ai.key, seller_ai.key, units),
         &[seller_ta_ai.clone(), vault_ai.clone(), seller_ai.clone(), token_ai.clone()],
     )?;
-    **pool_ai.try_borrow_mut_lamports()? -= gross;
-    **seller_ai.try_borrow_mut_lamports()? += to_seller;
-    if fee > 0 {
-        **creator_ai.try_borrow_mut_lamports()? += fee;
-    }
+    pay_out(program_id, ai, pool_ai, gross, seller_ai, to_seller, creator_ai, fee)?;
     if pool_ai.lamports() < rent_floor()? {
         return Err(err(E_INSUFFICIENT));
     }
@@ -656,10 +728,11 @@ fn migrate(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         &[vault_ai.clone(), migrator_ta_ai.clone(), pool_ai.clone(), token_ai.clone()],
         &[&[POOL_SEED, pool.mint.as_ref(), &[pool.bump]]],
     )?;
+    // OPS_SOL to the platform ops wallet, the rest to the migrator. With the
+    // optional payout PDA + system program these are real System transfers
+    // (explorer-visible); the migrator always passes them.
     let to_lp = pool.real_sol - OPS_SOL;
-    **pool_ai.try_borrow_mut_lamports()? -= pool.real_sol;
-    **platform_ai.try_borrow_mut_lamports()? += OPS_SOL;
-    **migrator_ai.try_borrow_mut_lamports()? += to_lp;
+    pay_out(program_id, ai, pool_ai, pool.real_sol, platform_ai, OPS_SOL, migrator_ai, to_lp)?;
     if pool_ai.lamports() < rent_floor()? {
         return Err(err(E_INSUFFICIENT));
     }

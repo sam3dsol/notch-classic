@@ -46,6 +46,13 @@ impl Rpc {
         v["result"].as_u64().unwrap_or(0)
     }
 
+    /// Raw jsonParsed transaction as a string (for asserting on account keys /
+    /// program invocations, e.g. that a System transfer is present).
+    pub async fn get_transaction(&self, sig: &str) -> String {
+        let v = self.call("getTransaction", serde_json::json!([sig, {"encoding":"jsonParsed","maxSupportedTransactionVersion":0,"commitment":"confirmed"}])).await;
+        v["result"].to_string()
+    }
+
     /// Local validator faucet. Waits until the balance lands.
     pub async fn airdrop(&self, pk: &Pubkey, lamports: u64) -> Result<(), String> {
         let before = self.balance(pk).await;
