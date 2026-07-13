@@ -1,0 +1,24 @@
+[package]
+name = "notch-classic"
+version = "0.1.0"
+edition = "2021"
+description = "NOTCH Classic: constant-product bonding curve launchpad. Bonding phase is open to NOTCH holders; graduated pools migrate to Raydium with the liquidity locked."
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+solana-program = "2.1.0"
+borsh = "1.5.1"
+solana-security-txt = "1.1.1"
+
+[features]
+# Local-validator test builds only: swaps the flagship NOTCH mint for the
+# committed dev keypair (dev-notch-mint.json at the repo root) so the hold
+# gates are testable off mainnet. Release builds use default features.
+dev-mint = []
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
