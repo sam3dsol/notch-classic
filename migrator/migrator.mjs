@@ -11,15 +11,16 @@
 //   3. creates a Raydium CPMM pool priced at the graduation price
 //      (~35 SOL : ~200M tokens, i.e. the exact price the curve closed at, so
 //      there is no arb gap), depositing all the received bonding SOL + tokens.
-//   4. permanently LOCKS 100% of the LP via Raydium's Burn & Earn program:
-//      the liquidity can never be withdrawn (the approved lock exception, this
-//      is users' liquidity), and a Fee Key NFT is minted to the platform
-//      wallet so the platform harvests the pool's trading fees forever.
+//   4. permanently LOCKS 100% of the LP via Raydium's Burn & Earn program as
+//      TWO 50/50 positions: the liquidity can never be withdrawn (approved lock
+//      exception, users' liquidity), and the pool's trading fees split 50/50
+//      via two Fee Key NFTs — one to the platform wallet, one to the token's
+//      creator — both claimable forever.
 //   5. records the migration + WhatsApp-alerts.
 //
 // HARVEST=1 mode: MANUAL ONLY (operator runs it by hand, never auto/cron).
-// Claims accrued trading fees from every locked pool's Fee Key NFT to the
-// platform wallet, then exits. Fees arrive as BOTH token and SOL (constant-
+// Claims accrued fees from each pool's PLATFORM Fee Key NFT to the platform
+// wallet, then exits. (The creator harvests their own half themselves.) Fees arrive as BOTH token and SOL (constant-
 // product pools skim the fee from each swap's input side). Claiming does NOT
 // swap or dump — it just credits the wallet; the operator keeps the SOL and
 // decides separately whether to hold or convert the token portion.
@@ -123,7 +124,7 @@ async function sendTx(ixs, signers, feePayer) {
 // forever AND mints a Fee Key NFT — sent to the platform wallet — that harvests
 // the pool's trading fees perpetually. Loaded lazily so the daemon starts even
 // if the (heavy) Raydium SDK is absent; only needed at migration.
-async function raydiumListAndLock(mint, tokenAmount, solAmount) {
+async function raydiumListAndLock(mint, tokenAmount, solAmount, creator) {
   const { Raydium, TxVersion, CREATE_CPMM_POOL_PROGRAM, CREATE_CPMM_POOL_FEE_ACC, getCpmmPdaPoolId } = await import('@raydium-io/raydium-sdk-v2');
   const { default: BN } = await import('bn.js');
   const raydium = await Raydium.load({ connection: conn, owner: migrator, cluster: 'mainnet' });
@@ -157,22 +158,29 @@ async function raydiumListAndLock(mint, tokenAmount, solAmount) {
   const { txId } = await execute({ sendAndConfirm: true });
   const lpMint = new PublicKey(extInfo.address.lpMint);
 
-  // permanently LOCK 100% of the LP via Burn & Earn; the Fee Key NFT goes to
-  // the platform wallet so the platform harvests this pool's trading fees
-  // forever. The liquidity itself can never be withdrawn.
+  // permanently LOCK 100% of the LP via Burn & Earn, as TWO 50/50 positions:
+  // half's Fee Key NFT -> the platform wallet, half -> the token's creator. So
+  // the graduated pool's trading fees split 50/50 between platform and creator,
+  // forever, while the liquidity itself can never be withdrawn.
   const lpAta = ata(migrator.publicKey, lpMint);
-  const lpBal = (await conn.getTokenAccountBalance(lpAta)).value.amount;
+  const lpBal = BigInt((await conn.getTokenAccountBalance(lpAta)).value.amount);
+  const halfPlatform = lpBal / 2n;
+  const halfCreator = lpBal - halfPlatform; // creator gets the odd unit, negligible
   const { poolInfo } = await raydium.cpmm.getPoolInfoFromRpc(extInfo.address.poolId);
-  const { execute: execLock, extInfo: lockInfo } = await raydium.cpmm.lockLp({
-    poolInfo,
-    lpAmount: new BN(lpBal),
-    withMetadata: true,
-    feeNftOwner: PLATFORM,
-    txVersion: TxVersion.V0,
-  });
-  const { txId: lockTx } = await execLock({ sendAndConfirm: true });
-  const feeNft = lockInfo?.nftMint?.toBase58?.() || null;
-  return { poolId: extInfo.address.poolId, lpMint: lpMint.toBase58(), createTx: txId, lockTx, feeNft, lpLocked: lpBal, feeOwner: PLATFORM.toBase58() };
+  const lock = async (amount, owner) => {
+    const { execute: ex, extInfo: li } = await raydium.cpmm.lockLp({
+      poolInfo, lpAmount: new BN(amount.toString()), withMetadata: true, feeNftOwner: owner, txVersion: TxVersion.V0,
+    });
+    const { txId: t } = await ex({ sendAndConfirm: true });
+    return { tx: t, nft: li?.nftMint?.toBase58?.() || null };
+  };
+  const plat = await lock(halfPlatform, PLATFORM);
+  const crea = await lock(halfCreator, creator);
+  return {
+    poolId: extInfo.address.poolId, lpMint: lpMint.toBase58(), createTx: txId, lpLocked: lpBal.toString(),
+    lockTxPlatform: plat.tx, feeNftPlatform: plat.nft, feeOwnerPlatform: PLATFORM.toBase58(),
+    lockTxCreator: crea.tx, feeNftCreator: crea.nft, feeOwnerCreator: creator.toBase58(),
+  };
 }
 
 async function migrateOne(rec) {
@@ -213,14 +221,14 @@ async function migrateOne(rec) {
     [platform], platform);
   console.log(`  pulled ${Number(MIGRATION_COST) / 1e9} SOL migration cost from platform wallet: ${topSig}`);
 
-  // 3+4. Raydium pool at the graduation price + lock LP (fee NFT to platform)
-  const r = await raydiumListAndLock(mint, tokBal, solForPool);
-  console.log(`  Raydium pool ${r.poolId} created ${r.createTx}, LP locked ${r.lockTx}, fee NFT ${r.feeNft} -> platform`);
+  // 3+4. Raydium pool at the graduation price + lock LP 50/50 (platform + creator)
+  const r = await raydiumListAndLock(mint, tokBal, solForPool, st.creator);
+  console.log(`  Raydium pool ${r.poolId} created ${r.createTx}; LP locked 50/50 — platform NFT ${r.feeNftPlatform}, creator NFT ${r.feeNftCreator} -> ${r.feeOwnerCreator}`);
 
   const done = loadDone();
   done[rec.mint] = { ...rec, migrateTx: migSig, ...r, ts: Math.floor(Date.now() / 1000) };
   saveDone(done);
-  await alert(`${rec.ticker} live on Raydium (pool ${r.poolId}), LP locked + fee NFT to platform. ${solForPool / 1_000_000_000n} SOL + tokens deposited.`);
+  await alert(`${rec.ticker} live on Raydium (pool ${r.poolId}), LP locked. Fees split 50/50 platform + creator. ${solForPool / 1_000_000_000n} SOL + tokens deposited.`);
 }
 
 // HARVEST mode: claim accrued trading fees from every locked pool's Fee Key NFT
@@ -233,11 +241,13 @@ async function harvestAll() {
   const done = loadDone();
   let claimed = 0;
   for (const rec of Object.values(done)) {
-    if (!rec.feeNft) continue;
+    // only the PLATFORM's half — the creator owns their own NFT and harvests it
+    // themselves from their Raydium portfolio.
+    if (!rec.feeNftPlatform) continue;
     try {
-      const { execute } = await raydium.cpmm.harvestLockLp({ nftMint: new PublicKey(rec.feeNft), lpFeeAmount: null, txVersion: TxVersion.V0 });
+      const { execute } = await raydium.cpmm.harvestLockLp({ nftMint: new PublicKey(rec.feeNftPlatform), lpFeeAmount: null, txVersion: TxVersion.V0 });
       const { txId } = await execute({ sendAndConfirm: true });
-      console.log(`  harvested ${rec.ticker} fees -> platform: ${txId}`);
+      console.log(`  harvested ${rec.ticker} platform-half fees: ${txId}`);
       claimed++;
     } catch (e) { console.error(`  harvest ${rec.ticker} failed:`, e.message); }
   }
