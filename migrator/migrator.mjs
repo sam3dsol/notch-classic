@@ -11,16 +11,20 @@
 //   3. creates a Raydium CPMM pool priced at the graduation price
 //      (~35 SOL : ~200M tokens, i.e. the exact price the curve closed at, so
 //      there is no arb gap), depositing all the received bonding SOL + tokens.
-//   4. burns 100% of the LP to the incinerator, permanently locking the
-//      liquidity (the approved exception to the never-lock-LP rule: this is
-//      users' liquidity, not ours).
+//   4. permanently LOCKS 100% of the LP via Raydium's Burn & Earn program:
+//      the liquidity can never be withdrawn (the approved lock exception, this
+//      is users' liquidity), and a Fee Key NFT is minted to the platform
+//      wallet so the platform harvests the pool's trading fees forever.
 //   5. records the migration + WhatsApp-alerts.
+//
+// HARVEST=1 mode: instead of polling, claims accrued trading fees from every
+// locked pool's Fee Key NFT to the platform wallet, then exits (run on a cron).
 //
 // Safety: DRY_RUN=1 by default (simulates, never signs a live migrate/pool).
 // Arm with DRY_RUN=0 once a real pool is close to graduating.
 
 import { Connection, Keypair, PublicKey, Transaction, TransactionInstruction, SystemProgram, ComputeBudgetProgram } from '@solana/web3.js';
-import { getAssociatedTokenAddressSync, createBurnInstruction, TOKEN_PROGRAM_ID } from '@solana/spl-token';
+import { getAssociatedTokenAddressSync, TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import fs from 'fs';
 
 const RPC = process.env.RPC;
@@ -110,10 +114,14 @@ async function sendTx(ixs, signers, feePayer) {
   return sig;
 }
 
-// Create the Raydium CPMM pool and burn the LP. Loaded lazily so the daemon
-// starts even if the (heavy) Raydium SDK is absent; only needed at migration.
+// Create the Raydium CPMM pool, then permanently LOCK the LP via Raydium's
+// Burn & Earn program. Locking (not burning) keeps the liquidity un-withdrawable
+// forever AND mints a Fee Key NFT — sent to the platform wallet — that harvests
+// the pool's trading fees perpetually. Loaded lazily so the daemon starts even
+// if the (heavy) Raydium SDK is absent; only needed at migration.
 async function raydiumListAndLock(mint, tokenAmount, solAmount) {
   const { Raydium, TxVersion, CREATE_CPMM_POOL_PROGRAM, CREATE_CPMM_POOL_FEE_ACC, getCpmmPdaPoolId } = await import('@raydium-io/raydium-sdk-v2');
+  const { default: BN } = await import('bn.js');
   const raydium = await Raydium.load({ connection: conn, owner: migrator, cluster: 'mainnet' });
   const ammConfigs = await raydium.api.getCpmmConfigs();
   const feeConfig = ammConfigs[0];
@@ -144,14 +152,23 @@ async function raydiumListAndLock(mint, tokenAmount, solAmount) {
   });
   const { txId } = await execute({ sendAndConfirm: true });
   const lpMint = new PublicKey(extInfo.address.lpMint);
-  // burn 100% of our LP to lock the liquidity
+
+  // permanently LOCK 100% of the LP via Burn & Earn; the Fee Key NFT goes to
+  // the platform wallet so the platform harvests this pool's trading fees
+  // forever. The liquidity itself can never be withdrawn.
   const lpAta = ata(migrator.publicKey, lpMint);
   const lpBal = (await conn.getTokenAccountBalance(lpAta)).value.amount;
-  let burnSig = null;
-  if (BigInt(lpBal) > 0n) {
-    burnSig = await sendTx([createBurnInstruction(lpAta, lpMint, migrator.publicKey, BigInt(lpBal))], [migrator]);
-  }
-  return { poolId: extInfo.address.poolId, lpMint: lpMint.toBase58(), createTx: txId, burnTx: burnSig, lpBurned: lpBal };
+  const { poolInfo } = await raydium.cpmm.getPoolInfoFromRpc(extInfo.address.poolId);
+  const { execute: execLock, extInfo: lockInfo } = await raydium.cpmm.lockLp({
+    poolInfo,
+    lpAmount: new BN(lpBal),
+    withMetadata: true,
+    feeNftOwner: PLATFORM,
+    txVersion: TxVersion.V0,
+  });
+  const { txId: lockTx } = await execLock({ sendAndConfirm: true });
+  const feeNft = lockInfo?.nftMint?.toBase58?.() || null;
+  return { poolId: extInfo.address.poolId, lpMint: lpMint.toBase58(), createTx: txId, lockTx, feeNft, lpLocked: lpBal, feeOwner: PLATFORM.toBase58() };
 }
 
 async function migrateOne(rec) {
@@ -192,14 +209,33 @@ async function migrateOne(rec) {
     [platform], platform);
   console.log(`  pulled ${Number(MIGRATION_COST) / 1e9} SOL migration cost from platform wallet: ${topSig}`);
 
-  // 3+4. Raydium pool at the graduation price + burn LP
+  // 3+4. Raydium pool at the graduation price + lock LP (fee NFT to platform)
   const r = await raydiumListAndLock(mint, tokBal, solForPool);
-  console.log(`  Raydium pool ${r.poolId} created ${r.createTx}, LP burned ${r.burnTx}`);
+  console.log(`  Raydium pool ${r.poolId} created ${r.createTx}, LP locked ${r.lockTx}, fee NFT ${r.feeNft} -> platform`);
 
   const done = loadDone();
   done[rec.mint] = { ...rec, migrateTx: migSig, ...r, ts: Math.floor(Date.now() / 1000) };
   saveDone(done);
-  await alert(`${rec.ticker} live on Raydium (pool ${r.poolId}), LP burned. ${solForPool / 1_000_000_000n} SOL + tokens deposited.`);
+  await alert(`${rec.ticker} live on Raydium (pool ${r.poolId}), LP locked + fee NFT to platform. ${solForPool / 1_000_000_000n} SOL + tokens deposited.`);
+}
+
+// HARVEST mode: claim accrued trading fees from every locked pool's Fee Key NFT
+// to the platform wallet. Run periodically (cron). Exits when done.
+async function harvestAll() {
+  const { Raydium, TxVersion } = await import('@raydium-io/raydium-sdk-v2');
+  const raydium = await Raydium.load({ connection: conn, owner: platform, cluster: 'mainnet' });
+  const done = loadDone();
+  let claimed = 0;
+  for (const rec of Object.values(done)) {
+    if (!rec.feeNft) continue;
+    try {
+      const { execute } = await raydium.cpmm.harvestLockLp({ nftMint: new PublicKey(rec.feeNft), lpFeeAmount: null, txVersion: TxVersion.V0 });
+      const { txId } = await execute({ sendAndConfirm: true });
+      console.log(`  harvested ${rec.ticker} fees -> platform: ${txId}`);
+      claimed++;
+    } catch (e) { console.error(`  harvest ${rec.ticker} failed:`, e.message); }
+  }
+  console.log(`harvest done: ${claimed} pool(s) claimed to platform ${platform.publicKey.toBase58()}`);
 }
 
 async function tick() {
@@ -212,6 +248,11 @@ async function tick() {
   }
 }
 
-console.log(`NOTCH Classic migrator up. DRY_RUN=${DRY ? 1 : 0}, poll ${POLL_MS}ms, migrator ${migrator.publicKey.toBase58()}`);
-tick();
-setInterval(tick, POLL_MS);
+if (process.env.HARVEST === '1') {
+  console.log('NOTCH Classic migrator: HARVEST mode');
+  harvestAll().then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1); });
+} else {
+  console.log(`NOTCH Classic migrator up. DRY_RUN=${DRY ? 1 : 0}, poll ${POLL_MS}ms, migrator ${migrator.publicKey.toBase58()}`);
+  tick();
+  setInterval(tick, POLL_MS);
+}
