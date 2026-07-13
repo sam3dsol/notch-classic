@@ -113,10 +113,22 @@ async function sendTx(ixs, signers, feePayer) {
 // Create the Raydium CPMM pool and burn the LP. Loaded lazily so the daemon
 // starts even if the (heavy) Raydium SDK is absent; only needed at migration.
 async function raydiumListAndLock(mint, tokenAmount, solAmount) {
-  const { Raydium, TxVersion, CREATE_CPMM_POOL_PROGRAM, CREATE_CPMM_POOL_FEE_ACC, getCpmmPdaAmmConfigId } = await import('@raydium-io/raydium-sdk-v2');
+  const { Raydium, TxVersion, CREATE_CPMM_POOL_PROGRAM, CREATE_CPMM_POOL_FEE_ACC, getCpmmPdaPoolId } = await import('@raydium-io/raydium-sdk-v2');
   const raydium = await Raydium.load({ connection: conn, owner: migrator, cluster: 'mainnet' });
   const ammConfigs = await raydium.api.getCpmmConfigs();
   const feeConfig = ammConfigs[0];
+
+  // SAFETY: only ever CREATE a fresh pool, never deposit into an existing one.
+  // CPMM pool ids are deterministic from (program, config, sorted mints); if
+  // our canonical pool already exists (e.g. a squatter front-ran the listing),
+  // abort and leave it for the operator — never add liquidity to someone
+  // else's pool.
+  const [a, b] = [mint, WSOL].sort((x, y) => (x.toBuffer().compare(y.toBuffer())));
+  const poolId = getCpmmPdaPoolId(CREATE_CPMM_POOL_PROGRAM, new PublicKey(feeConfig.id), a, b).publicKey;
+  if (await conn.getAccountInfo(poolId)) {
+    throw new Error(`Raydium pool ${poolId.toBase58()} already exists for ${mint.toBase58()} — refusing to add liquidity, operator must handle`);
+  }
+
   const { execute, extInfo } = await raydium.cpmm.createPool({
     programId: CREATE_CPMM_POOL_PROGRAM,
     poolFeeAccount: CREATE_CPMM_POOL_FEE_ACC,
