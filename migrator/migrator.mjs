@@ -5,13 +5,16 @@
 //   1. calls the on-chain Migrate instruction with the MIGRATOR key: 5 SOL ops
 //      -> platform wallet, the remaining ~35 SOL + all unsold tokens -> this
 //      migrator wallet (real System/SPL transfers, explorer-visible).
-//   2. creates a Raydium CPMM pool priced at the graduation price
+//   2. pulls the Raydium pool-creation cost (~0.4 SOL: 0.15 create fee + rents
+//      + gas) FROM the platform fee wallet, so the whole bonding SOL becomes
+//      pool depth. The 5 SOL ops = 4 DexScreener listing + 1 migration + MM.
+//   3. creates a Raydium CPMM pool priced at the graduation price
 //      (~35 SOL : ~200M tokens, i.e. the exact price the curve closed at, so
-//      there is no arb gap), depositing the received SOL + tokens.
-//   3. burns 100% of the LP to the incinerator, permanently locking the
+//      there is no arb gap), depositing all the received bonding SOL + tokens.
+//   4. burns 100% of the LP to the incinerator, permanently locking the
 //      liquidity (the approved exception to the never-lock-LP rule: this is
 //      users' liquidity, not ours).
-//   4. records the migration + WhatsApp-alerts.
+//   5. records the migration + WhatsApp-alerts.
 //
 // Safety: DRY_RUN=1 by default (simulates, never signs a live migrate/pool).
 // Arm with DRY_RUN=0 once a real pool is close to graduating.
@@ -40,6 +43,17 @@ const migrator = kp(process.env.MIGRATOR_KP || '/root/vault/notch-classic/migrat
 if (migrator.publicKey.toBase58() !== '3tUp4eSggj6PmHkL4jY1JmBrQUGzbdMdcZx3N7g1UiEM') {
   console.error('FATAL: migrator key mismatch'); process.exit(1);
 }
+// The platform fee wallet receives the 5 SOL ops carve-out at each migration
+// (4 SOL DexScreener listing + 1 SOL migration mechanics + market making). The
+// migrator draws its Raydium pool-creation cost from this wallet, so the whole
+// bonding-curve SOL goes into the pool as depth.
+const platform = kp(process.env.PLATFORM_KP || '/root/vault/notch-classic/platform-fee-keypair.json');
+if (platform.publicKey.toBase58() !== PLATFORM.toBase58()) {
+  console.error('FATAL: platform key mismatch'); process.exit(1);
+}
+// Migration mechanical cost pulled from the platform wallet per graduation:
+// Raydium CPMM creation fee (0.15) + pool account rents (~0.25) + gas margin.
+const MIGRATION_COST = 500_000_000n; // 0.5 SOL
 
 const enc = (s) => new TextEncoder().encode(s);
 const poolPda = (mint) => PublicKey.findProgramAddressSync([enc('pool'), mint.toBytes()], PROGRAM)[0];
@@ -85,10 +99,10 @@ async function alert(text) {
 const loadDone = () => { try { return JSON.parse(fs.readFileSync(DONE, 'utf8')); } catch (e) { return {}; } };
 const saveDone = (o) => { try { fs.writeFileSync(DONE + '.tmp', JSON.stringify(o)); fs.renameSync(DONE + '.tmp', DONE); } catch (e) {} };
 
-async function sendTx(ixs, signers) {
+async function sendTx(ixs, signers, feePayer) {
   const tx = new Transaction();
   ixs.forEach((i) => tx.add(i));
-  tx.feePayer = migrator.publicKey;
+  tx.feePayer = (feePayer || migrator).publicKey;
   tx.recentBlockhash = (await conn.getLatestBlockhash()).blockhash;
   tx.sign(...signers);
   const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: false });
@@ -149,16 +163,24 @@ async function migrateOne(rec) {
     return;
   }
 
-  // 1. on-chain migrate: SOL + tokens land in the migrator wallet
+  // 1. on-chain migrate: 5 SOL ops -> platform wallet, the remaining bonding SOL
+  //    + all unsold tokens -> migrator wallet.
   const solBefore = await conn.getBalance(migrator.publicKey);
   const migSig = await sendTx([ComputeBudgetProgram.setComputeUnitLimit({ units: 120000 }), ixMigrate(mint)], [migrator]);
   console.log(`  migrated on-chain: ${migSig}`);
   const tokBal = (await conn.getTokenAccountBalance(ata(migrator.publicKey, mint))).value.amount;
-  const solAfter = await conn.getBalance(migrator.publicKey);
-  // the LP SOL is what the migrator received (minus a little tx fee); pool it all
-  const solForPool = BigInt(Math.max(0, solAfter - solBefore));
+  const solAfterMigrate = await conn.getBalance(migrator.publicKey);
+  // Pure bonding SOL the migrator received; ALL of it goes into the pool as depth.
+  const solForPool = BigInt(Math.max(0, solAfterMigrate - solBefore));
 
-  // 2+3. Raydium pool at the graduation price + burn LP
+  // 2. cover the Raydium pool-creation cost from the platform fee wallet (from
+  //    the 5 SOL ops it just received), so no bonding SOL is spent on mechanics.
+  const topSig = await sendTx(
+    [SystemProgram.transfer({ fromPubkey: platform.publicKey, toPubkey: migrator.publicKey, lamports: Number(MIGRATION_COST) })],
+    [platform], platform);
+  console.log(`  pulled ${Number(MIGRATION_COST) / 1e9} SOL migration cost from platform wallet: ${topSig}`);
+
+  // 3+4. Raydium pool at the graduation price + burn LP
   const r = await raydiumListAndLock(mint, tokBal, solForPool);
   console.log(`  Raydium pool ${r.poolId} created ${r.createTx}, LP burned ${r.burnTx}`);
 
