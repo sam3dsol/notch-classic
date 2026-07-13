@@ -7,6 +7,12 @@ requires holding 0.1 $NOTCH and buying on the curve requires holding 0.05
 $NOTCH. Balances are checked on chain and never debited. Sells are never
 gated. Graduated pools migrate to Raydium and the liquidity is locked.
 
+## Deployed
+
+Program id on Solana mainnet: `rqPbThPVCPKgoK823z6gFbn2EcP7QmQRqn297LC1ass`
+(upgradeable, authority is the platform deployer). The deployed bytecode
+matches this repository.
+
 ## Fixed economics
 
 Every pool uses the same parameters. There are no per launch knobs.
